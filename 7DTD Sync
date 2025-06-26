@@ -1,0 +1,285 @@
+<#
+.SYNOPSIS
+    Instalador y configurador automático para 7DTD Sync Companion (versión mejorada).
+    Crea la estructura en Dropbox, configura scripts y Launcher de forma robusta.
+.DESCRIPTION
+    Este script realiza todos los pasos para configurar 7DTD Sync Companion:
+    1.  Verifica y eleva sus propios permisos a Administrador si es necesario.
+    2.  Verifica y ajusta la política de ejecución de PowerShell (manejando todos los errores de forma no bloqueante).
+    3.  Pide al usuario que seleccione su carpeta principal de Dropbox (o la detecta) y valida la ruta.
+    4.  Pide al usuario que seleccione la PARTIDA de 7DTD a sincronizar (detecta anidamiento de forma robusta).
+    5.  Crea la estructura de carpetas necesarias en Dropbox.
+    6.  Genera los archivos 7DTD-Sync.ps1, 7DTD-Sync.ini y Launcher.bat.
+.NOTES
+    Este script solicitará permisos de Administrador automáticamente si no se ejecuta con ellos.
+#>
+
+# ========================= Elevación Automática a Administrador =========================
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Host "Este script necesita permisos de Administrador para funcionar correctamente." -ForegroundColor Yellow
+    Write-Host "Se relanzará automáticamente con privilegios elevados. Por favor, acepta la solicitud UAC." -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
+    $Process = New-Object System.Diagnostics.ProcessStartInfo
+    $Process.FileName = "powershell.exe"
+    $Process.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    $Process.Verb = "RunAs"
+    try { [System.Diagnostics.Process]::Start($Process) | Out-Null } catch {
+        Write-Host "Error al intentar relanzar el script con permisos de Administrador." -ForegroundColor Red
+        Read-Host "Presiona Enter para salir."
+        exit 1
+    }
+    exit
+}
+
+# ========================= Utilidades Mejoradas =========================
+function Write-Host-Color { param([string]$Message, [ConsoleColor]$Color="White"); Write-Host $Message -ForegroundColor $Color }
+
+function DetectDropboxRootPath {
+    $potentialPaths = @(
+        (Join-Path $env:APPDATA "Dropbox"),
+        (Join-Path $env:LOCALAPPDATA "Dropbox"),
+        (Join-Path $env:USERPROFILE "Dropbox")
+    )
+    foreach ($path in $potentialPaths) {
+        if (Test-Path (Join-Path $path "info.json")) {
+            try { $personalPath = (Get-Content (Join-Path $path "info.json") | ConvertFrom-Json).personal.path; if (Test-Path $personalPath) { return $personalPath } } catch {}
+        }
+    }
+    $DefaultPath = Join-Path $env:USERPROFILE "Dropbox"; if (Test-Path $DefaultPath) { return $DefaultPath }; return ""
+}
+
+# ========================= Scripts internos mejorados =========================
+$7DTD_Sync_PS1_Content = @"
+<#
+.SYNOPSIS
+    Sincronizador de partidas de 7 Days to Die con Dropbox.
+.DESCRIPTION
+    Ejecuta en modo 'pull' (descargar partida de la nube) o 'push' (subir progreso a la nube).
+.PARAMETER OverrideDirection
+    'pull' o 'push'. Si no se especifica, solicita al usuario.
+#>
+param([ValidateSet('pull','push')][string]`$OverrideDirection)
+
+function Write-Log {
+    param(`$msg)
+    `$logPath = Join-Path (Split-Path `$MyInvocation.MyCommand.Definition) "7DTD-Sync.log"
+    "`$((Get-Date).ToString('s')) `$msg" | Out-File -FilePath `$logPath -Append -Encoding UTF8
+}
+
+`$ErrorActionPreference = "Stop"
+try {
+    `$ScriptRoot = Split-Path -Parent `$MyInvocation.MyCommand.Definition
+    `$iniPath = Join-Path `$ScriptRoot '7DTD-Sync.ini'
+    if (-not (Test-Path `$iniPath)) { Write-Log "ERROR: Falta INI `$iniPath"; throw "Falta INI: `$iniPath" }
+    `$cfg = Get-Content `$iniPath | Where-Object { `$_ -match "=" } | ForEach-Object {
+        `$kv = `$_ -split "=",2
+        @{(`$kv[0].Trim()) = `$kv[1].Trim(' "',"'")}
+    } | ForEach-Object { `$_ }
+    `$ini = @{}
+    foreach (`$h in `$cfg) { `$ini += `$h }
+    `$CloudDir = `$ini.CloudDir
+    `$GameName = `$ini.GameName
+    `$LocalSaves = Join-Path `$env:APPDATA "7DaysToDie\Saves"
+    `$GameWorld = (Get-ChildItem -Path `$LocalSaves -Recurse -Directory | Where-Object { `$_.Name -eq `$GameName }).Parent.Name
+    `$LocalPath = Join-Path `$LocalSaves "`$GameWorld\`$GameName"
+    `$CloudPath = Join-Path `$CloudDir "Saves\`$GameWorld\`$GameName"
+    `$BackupsPath = Join-Path `$CloudDir "Backups"
+
+    if (-not `$OverrideDirection) {
+        `$OverrideDirection = Read-Host "¿Sincronizar 'pull' (descargar) o 'push' (subir)?"
+    }
+
+    if (`$OverrideDirection -eq "pull") {
+        Write-Log "Iniciando sincronización PULL"
+        if (Test-Path `$LocalPath) {
+            `$backupName = "`$GameName-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            `$backupDest = Join-Path `$BackupsPath `$backupName
+            Copy-Item `$LocalPath `$backupDest -Recurse -Force
+            Write-Log "Backup local creado en `$backupDest"
+        }
+        if (Test-Path `$CloudPath) {
+            Remove-Item `$LocalPath -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item `$CloudPath `$LocalPath -Recurse -Force
+            Write-Log "Partida descargada de la nube en `$LocalPath"
+        } else {
+            Write-Log "No existe partida en la nube. Nada que descargar."
+        }
+    } elseif (`$OverrideDirection -eq "push") {
+        Write-Log "Iniciando sincronización PUSH"
+        if (Test-Path `$LocalPath) {
+            Remove-Item `$CloudPath -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item `$LocalPath `$CloudPath -Recurse -Force
+            Write-Log "Partida subida a la nube en `$CloudPath"
+        } else {
+            Write-Log "No se encontró partida local para subir."
+        }
+    } else {
+        Write-Log "Dirección no válida: `$OverrideDirection"
+        throw "Modo no válido: `$OverrideDirection"
+    }
+    Write-Log "Sincronización finalizada correctamente."
+} catch {
+    Write-Log "ERROR: `$_."
+    Write-Host "Hubo un error: `$_. " -ForegroundColor Red
+    exit 1
+}
+"@
+
+$Launcher_BAT_Content = @"
+@echo off
+REM Launcher.bat – Automático Pull -> Juego -> Push
+setlocal enabledelayedexpansion
+
+REM === Cargar INI ===
+set "INI_PATH=%~dp0\7DTD-Sync.ini"
+for /f "usebackq tokens=1,* delims==" %%A in (`findstr /B /I "GameName" "%INI_PATH%"`) do set "GameName=%%~B"
+set "PS1_PATH=%~dp0\7DTD-Sync.ps1"
+
+echo [1/3] Sincronizando (Pull) la partida !GameName! desde la nube...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_PATH%" pull
+if errorlevel 1 (
+    echo Error en la sincronización pull. Revisa el log.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [2/3] Abriendo 7 Days to Die por Steam…
+start "" "steam://run/251570"
+timeout /t 5 >nul
+echo [3/3] Esperando a que cierres el juego para guardar tu progreso en la nube...
+:WAIT_LOOP
+timeout /t 10 >nul
+tasklist /FI "IMAGENAME eq 7DaysToDie.exe" | find /I "7DaysToDie.exe" >nul
+if errorlevel 1 goto POST_GAME
+goto WAIT_LOOP
+
+:POST_GAME
+echo.
+echo [4/3] Sincronizando (Push) la partida !GameName! hacia la nube...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1_PATH%" push
+if errorlevel 1 (
+    echo Error en la sincronización push. Revisa el log.
+    pause
+    exit /b 1
+)
+echo.
+echo Sincronización completada. ¡Puedes cerrar esta ventana!
+timeout /t 5
+exit /b
+"@
+
+# ========================= Política de Ejecución =========================
+Write-Host-Color "Ajustando la política de ejecución de PowerShell a 'RemoteSigned' para el usuario actual..." Cyan
+try {
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
+    Write-Host-Color "Política de ejecución ajustada con éxito." Green
+} catch {
+    Write-Host-Color "ADVERTENCIA: No se pudo cambiar la Política de Ejecución de PowerShell." Yellow
+    Write-Host-Color "No es un problema grave, ya que el Launcher.bat generado se saltará esta política." Yellow
+    Write-Host-Color "Continuando con la instalación..." Yellow
+    Start-Sleep -Seconds 3
+}
+
+# ========================= Detección y Confirmación de Dropbox =========================
+Write-Host-Color "`n=== Instalador y Configuración de 7DTD Sync Companion ===" Green
+Write-Host-Color "Este script configurará las herramientas para sincronizar una PARTIDA específica de 7 Days to Die con Dropbox." Cyan
+
+$DropboxRoot = ""
+$DetectedDropboxPath = DetectDropboxRootPath
+if ($DetectedDropboxPath) {
+    Write-Host-Color "Dropbox detectado en: $DetectedDropboxPath" Green
+    $ConfirmDropbox = Read-Host "¿Es esta la ruta correcta para tu carpeta principal de Dropbox? (S/N) [S]"
+    if ($ConfirmDropbox -eq "" -or $ConfirmDropbox.ToLower() -eq "s") {
+        $DropboxRoot = $DetectedDropboxPath
+    }
+}
+# --- Corrección robusta aquí ---
+while ([string]::IsNullOrWhiteSpace($DropboxRoot) -or -not (Test-Path $DropboxRoot) -or -not (Test-Path (Join-Path $DropboxRoot ".dropbox") -or Test-Path (Join-Path $DropboxRoot "info.json"))) {
+    Write-Host-Color "Por favor, introduce la ruta COMPLETA de tu carpeta principal de Dropbox (ej: C:\Users\TuUsuario\Dropbox)" Yellow
+    $DropboxRoot = Read-Host
+    if ([string]::IsNullOrWhiteSpace($DropboxRoot) -or -not (Test-Path $DropboxRoot)) {
+        Write-Host-Color "La ruta introducida no existe o no es válida. Inténtalo de nuevo." Red
+        $DropboxRoot = ""
+        continue
+    } elseif (-not (Test-Path (Join-Path $DropboxRoot ".dropbox") -or Test-Path (Join-Path $DropboxRoot "info.json"))) {
+        Write-Host-Color "Advertencia: Esa carpeta no parece contener una instalación de Dropbox." Yellow
+        $conf = Read-Host "¿Deseas usarla igualmente? (S/N) [N]"
+        if ($conf.ToLower() -ne "s") { $DropboxRoot = ""; continue }
+    }
+}
+# --- Fin corrección ---
+
+$CloudDir = Join-Path $DropboxRoot "7DTDWorld"
+Write-Host-Color "La carpeta raíz de la sincronización será: $CloudDir" Cyan
+
+# ========================= Selección de Partida =========================
+Write-Host-Color "`nListando PARTIDAS de 7 Days to Die guardadas localmente..." Cyan
+$LocalSavesRoot = Join-Path $env:APPDATA "7DaysToDie\Saves"
+$GameFolders = @(Get-ChildItem -Path $LocalSavesRoot -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path (Join-Path $_.FullName "main.ttw") } | Select-Object Name, FullName, @{Name="Mundo";Expression={($_.FullName -replace [regex]::Escape($LocalSavesRoot),"") -replace '^[\\\/]','' -replace '[\\\/].*',''}})
+if ($GameFolders.Count -eq 0) {
+    Write-Host-Color "No se encontraron partidas guardadas localmente en $LocalSavesRoot." Yellow
+    $PartidaName = Read-Host "Por favor, introduce el nombre exacto de la PARTIDA que deseas sincronizar"
+    $MundoPadreDetected = $PartidaName
+} else {
+    Write-Host-Color "Partidas detectadas:" Cyan
+    for ($i = 0; $i -lt $GameFolders.Count; $i++) { Write-Host-Color ("{0,3}. {1} (Mundo: {2})" -f ($i+1), $GameFolders[$i].Name, $GameFolders[$i].Mundo) White }
+    $SelectedGame = $null
+    while ($SelectedGame -eq $null) {
+        $Selection = Read-Host "Introduce el número de la partida a sincronizar"
+        if (($Selection -as [int]) -and $Selection -gt 0 -and $Selection -le $GameFolders.Count) { $SelectedGame = $GameFolders[$Selection-1] } 
+        else { Write-Host-Color "Selección no válida. Por favor, introduce un número de la lista." Red }
+    }
+    $PartidaName = $SelectedGame.Name
+    $MundoPadreDetected = $SelectedGame.Mundo
+}
+Write-Host-Color "Partida seleccionada: '$PartidaName' (del mundo '$MundoPadreDetected')" Cyan
+
+# ========================= Crear Estructura de Carpetas =========================
+Write-Host-Color "`nCreando estructura de carpetas en Dropbox..." Cyan
+$CloudSavesBaseDir = Join-Path $CloudDir "Saves"
+$CloudGeneratedWorldsBaseDir = Join-Path $CloudDir "GeneratedWorlds"
+$CloudBackupsDir = Join-Path $CloudDir "Backups"
+$CloudScriptsDir = Join-Path $CloudDir "Scripts"
+$CloudPartidaFolder = Join-Path $CloudSavesBaseDir $MundoPadreDetected $PartidaName
+$CloudGeneratedWorldFolder = Join-Path $CloudGeneratedWorldsBaseDir $MundoPadreDetected
+New-Item -ItemType Directory -Path $CloudPartidaFolder -Force | Out-Null
+New-Item -ItemType Directory -Path $CloudGeneratedWorldFolder -Force | Out-Null
+New-Item -ItemType Directory -Path $CloudBackupsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $CloudScriptsDir -Force | Out-Null
+Write-Host-Color "Estructura de carpetas creada/verificada." Green
+
+# ========================= Generar Scripts y Configuración =========================
+Write-Host-Color "`nGenerando y copiando archivos de configuración y scripts..." Cyan
+$IniFilePath = Join-Path $CloudScriptsDir "7DTD-Sync.ini"
+$IniContent = @"
+CloudDir="$CloudDir"
+GameName="$PartidaName"
+"@
+$IniContent | Set-Content -Path $IniFilePath -Encoding UTF8; Write-Host-Color "Archivo 7DTD-Sync.ini creado." Green
+
+$SyncScriptPath = Join-Path $CloudScriptsDir "7DTD-Sync.ps1"
+$7DTD_Sync_PS1_Content | Set-Content -Path $SyncScriptPath -Encoding UTF8; Write-Host-Color "Script 7DTD-Sync.ps1 creado." Green
+
+$LauncherPath = Join-Path $CloudScriptsDir "Launcher.bat"
+$Launcher_BAT_Content | Set-Content -Path $LauncherPath -Encoding ASCII; Write-Host-Color "Launcher.bat creado." Green
+
+# ========================= Log de Instalación =========================
+try {
+    $logPath = Join-Path $CloudScriptsDir "install_log.txt"
+    "$(Get-Date -Format s) Instalación completada para partida $PartidaName (Mundo: $MundoPadreDetected), Dropbox: $DropboxRoot" | Out-File -FilePath $logPath -Append -Encoding UTF8
+} catch {}
+
+# ========================= Instrucciones Finales =========================
+Write-Host-Color "`n=== Instalación Completa ===" Green
+Write-Host-Color "¡El sistema 7DTD Sync Companion está configurado y listo!" Cyan
+Write-Host-Color "`nAhora, para jugar, debes usar SIEMPRE el archivo 'Launcher.bat' que se encuentra en:" White
+Write-Host-Color "    $CloudScriptsDir\Launcher.bat" Yellow
+Write-Host-Color "Consejo: Crea un acceso directo a este archivo en tu Escritorio para mayor comodidad." White
+Write-Host-Color "`nAl ejecutar 'Launcher.bat':" White
+Write-Host-Color "1. Descargará la última versión de la partida desde Dropbox." Yellow
+Write-Host-Color "2. Abrirá el juego 7 Days to Die." Yellow
+Write-Host-Color "3. Cuando cierres el juego, subirá tu progreso a Dropbox." Yellow
+Write-Host-Color "`n¡A disfrutar de tus partidas sincronizadas!" Green
+
+Read-Host "Presiona Enter para finalizar."
